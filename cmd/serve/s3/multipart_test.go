@@ -1086,3 +1086,45 @@ func TestWaitForTurnRejectsBogusSize(t *testing.T) {
 	up.mu.Unlock()
 	<-admitted
 }
+
+// TestWaitForTurnRejectsOverflowingReservation checks that huge declared
+// lengths sent by concurrent requests for the next part can't overflow the
+// running total negative and so admit out-of-order parts past the buffer
+// limit.
+func TestWaitForTurnRejectsOverflowingReservation(t *testing.T) {
+	const huge = 5_000_000_000_000_000_000
+	up := newMultipartUpload("bucket", "key", "bucket/key", "bucket/key", nil, 1<<20)
+
+	// The first request for the next part is admitted.
+	require.NoError(t, up.waitForTurn(1, huge))
+
+	// Concurrent requests for the same part and one out of order must all
+	// wait rather than be charged to the buffer.
+	admitted := make(chan struct{}, 3)
+	for _, part := range []struct {
+		number int
+		size   int64
+	}{{1, huge}, {1, huge}, {3, 8 << 20}} {
+		go func() {
+			_ = up.waitForTurn(part.number, part.size)
+			admitted <- struct{}{}
+		}()
+	}
+	select {
+	case <-admitted:
+		t.Fatal("part admitted past the buffer limit")
+	case <-time.After(50 * time.Millisecond):
+	}
+	up.mu.Lock()
+	assert.Equal(t, int64(huge), up.buffered)
+	up.mu.Unlock()
+
+	// Wake the blocked goroutines so they don't leak.
+	up.mu.Lock()
+	up.closed = true
+	up.cond.Broadcast()
+	up.mu.Unlock()
+	for range 3 {
+		<-admitted
+	}
+}

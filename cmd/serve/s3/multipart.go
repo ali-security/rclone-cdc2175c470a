@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path"
 	"sort"
 	"strings"
@@ -251,7 +252,10 @@ func (b *s3Backend) UploadPart(ctx context.Context, bucketName, objectName strin
 //
 // size is the client-declared part length and is not trusted: a negative value
 // is rejected, and the admission test is written so a huge value can't overflow
-// the running total and wrongly admit further parts past the limit.
+// the running total and wrongly admit further parts past the limit. A
+// reservation which would overflow the running total waits, even for the next
+// part, so concurrent requests for the next part declaring huge lengths can't
+// wrap it negative.
 func (up *multipartUpload) waitForTurn(partNumber int, size int64) error {
 	if size < 0 {
 		return gofakes3.ErrInvalidArgument
@@ -262,7 +266,8 @@ func (up *multipartUpload) waitForTurn(partNumber int, size int64) error {
 		if up.closed {
 			return gofakes3.ErrNoSuchUpload
 		}
-		if up.bufferLimit <= 0 || partNumber <= up.nextPart || up.buffered == 0 || size <= up.bufferLimit-up.buffered {
+		fits := up.bufferLimit <= 0 || partNumber <= up.nextPart || up.buffered == 0 || size <= up.bufferLimit-up.buffered
+		if fits && size <= math.MaxInt64-up.buffered {
 			up.buffered += size
 			return nil
 		}
