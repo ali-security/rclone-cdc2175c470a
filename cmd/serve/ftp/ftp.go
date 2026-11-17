@@ -513,12 +513,7 @@ func (d *driver) MakeDir(sctx *ftp.Context, path string) (err error) {
 	if err != nil {
 		return err
 	}
-	dir, leaf, err := VFS.StatParent(path)
-	if err != nil {
-		return err
-	}
-	_, err = dir.Mkdir(leaf)
-	return err
+	return VFS.Mkdir(path, 0777)
 }
 
 // GetFile download a file
