@@ -587,7 +587,7 @@ func TestMultipartAbortAlwaysSucceeds(t *testing.T) {
 	up.fh = failingSink{}
 	up.vfs = _vfs
 	const uploadID = gofakes3.UploadID("failing-close")
-	b.multipartUploads.Store(uploadID, up)
+	b.addUpload(b.tenant(ctx), uploadID, up)
 
 	require.NoError(t, b.AbortMultipartUpload(ctx, bucket, "key", uploadID))
 
@@ -611,12 +611,40 @@ func TestMultipartCompleteRenameFailureKeepsUpload(t *testing.T) {
 	up.fh = &stubSink{}
 	up.vfs = _vfs
 	const uploadID = gofakes3.UploadID("rename-fails")
-	b.multipartUploads.Store(uploadID, up)
+	b.addUpload(b.tenant(ctx), uploadID, up)
 
 	_, _, err = b.CompleteMultipartUpload(ctx, bucket, "key", uploadID, &gofakes3.CompleteMultipartUploadRequest{})
 	require.Error(t, err)
-	_, err = b.loadUpload(uploadID)
+	_, err = b.loadUpload(ctx, uploadID)
 	require.NoError(t, err, "the upload record must survive a retryable Complete failure")
+}
+
+// TestMultipartOtherTenant checks that with an auth proxy one user
+// (access key ID) can't upload parts to, complete or abort another
+// user's multipart upload even if it knows the upload ID.
+func TestMultipartOtherTenant(t *testing.T) {
+	b, f, bucket := newPutTestBackend(t, "", nil)
+	ctxA, ctxB := tenantCtx("tenantA"), tenantCtx("tenantB")
+	const object = "victim.bin"
+
+	uploadID, err := b.CreateMultipartUpload(ctxA, bucket, object, nil)
+	require.NoError(t, err)
+
+	data := []byte(random.String(1024))
+	_, err = b.UploadPart(ctxB, bucket, object, uploadID, 1, int64(len(data)), bytes.NewReader(data))
+	assert.ErrorIs(t, err, gofakes3.ErrNoSuchUpload, "UploadPart by another user")
+	require.ErrorIs(t, b.AbortMultipartUpload(ctxB, bucket, object, uploadID), gofakes3.ErrNoSuchUpload, "Abort by another user")
+
+	etag, err := b.UploadPart(ctxA, bucket, object, uploadID, 1, int64(len(data)), bytes.NewReader(data))
+	require.NoError(t, err)
+	input := &gofakes3.CompleteMultipartUploadRequest{Parts: []gofakes3.CompletedPart{{PartNumber: 1, ETag: etag}}}
+	_, _, err = b.CompleteMultipartUpload(ctxB, bucket, object, uploadID, input)
+	assert.ErrorIs(t, err, gofakes3.ErrNoSuchUpload, "Complete by another user")
+
+	// The owner's upload is untouched by the other user's attempts.
+	_, _, err = b.CompleteMultipartUpload(ctxA, bucket, object, uploadID, input)
+	require.NoError(t, err)
+	assert.Equal(t, data, readObject(t, f, bucket, object))
 }
 
 // TestMultipartReaper checks that an incomplete multipart upload abandoned
@@ -665,7 +693,7 @@ func TestMultipartReapExpiredUploads(t *testing.T) {
 		up := newMultipartUpload(bucket, id, bucket+"/"+id, bucket+"/"+multipartUploadPrefix+id, nil, 0)
 		up.fh = &stubSink{}
 		up.vfs = _vfs
-		b.multipartUploads.Store(gofakes3.UploadID(id), up)
+		b.addUpload(b.tenant(ctx), gofakes3.UploadID(id), up)
 		return up
 	}
 
@@ -684,11 +712,11 @@ func TestMultipartReapExpiredUploads(t *testing.T) {
 
 	b.reapExpiredUploads(now, expiry)
 
-	_, err = b.loadUpload("fresh")
+	_, err = b.loadUpload(ctx, "fresh")
 	assert.NoError(t, err, "a fresh upload must not be reaped")
-	_, err = b.loadUpload("busy")
+	_, err = b.loadUpload(ctx, "busy")
 	assert.NoError(t, err, "an upload with a request in flight must not be reaped")
-	_, err = b.loadUpload("idle")
+	_, err = b.loadUpload(ctx, "idle")
 	assert.ErrorIs(t, err, gofakes3.ErrNoSuchUpload, "an idle upload past the expiry must be reaped")
 
 	// The reaped upload was aborted, not committed.

@@ -54,8 +54,9 @@ type multipartUpload struct {
 	streamFp    string // path the parts are written to (fp when the remote has no server-side move or copy)
 	meta        map[string]string
 
-	fh  io.WriteCloser // sink the in-order parts are written to
-	vfs *vfs.VFS       // the VFS fh was created on, used for all later operations
+	fh     io.WriteCloser // sink the in-order parts are written to
+	vfs    *vfs.VFS       // the VFS fh was created on, used for all later operations
+	tenant *tenant        // the user the upload belongs to
 
 	mu        sync.Mutex
 	cond      *sync.Cond     // signalled when buffered shrinks, nextPart advances or the upload closes
@@ -107,13 +108,25 @@ func (up *multipartUpload) endActivity() {
 	up.mu.Unlock()
 }
 
-// loadUpload looks up an in-flight upload by ID.
-func (b *s3Backend) loadUpload(uploadID gofakes3.UploadID) (*multipartUpload, error) {
-	v, ok := b.multipartUploads.Load(uploadID)
+// loadUpload looks up an in-flight upload of the user making the request
+// in ctx by ID.
+func (b *s3Backend) loadUpload(ctx context.Context, uploadID gofakes3.UploadID) (*multipartUpload, error) {
+	v, ok := b.tenant(ctx).uploads.Load(uploadID)
 	if !ok {
 		return nil, gofakes3.ErrNoSuchUpload
 	}
 	return v.(*multipartUpload), nil
+}
+
+// addUpload records a new in-flight upload of t.
+func (b *s3Backend) addUpload(t *tenant, uploadID gofakes3.UploadID, up *multipartUpload) {
+	up.tenant = t
+	t.uploads.Store(uploadID, up)
+}
+
+// deleteUpload removes the record of an in-flight upload, if present.
+func (b *s3Backend) deleteUpload(uploadID gofakes3.UploadID, up *multipartUpload) {
+	up.tenant.uploads.Delete(uploadID)
 }
 
 // CreateMultipartUpload begins a new multipart upload.
@@ -183,13 +196,13 @@ func (b *s3Backend) CreateMultipartUpload(ctx context.Context, bucketName, objec
 	up.fh = fh
 	up.vfs = _vfs
 
-	b.multipartUploads.Store(uploadID, up)
+	b.addUpload(b.tenant(ctx), uploadID, up)
 	return uploadID, nil
 }
 
 // UploadPart writes a single part from the S3 client into the streaming upload.
 func (b *s3Backend) UploadPart(ctx context.Context, bucketName, objectName string, uploadID gofakes3.UploadID, partNumber int, contentLength int64, body io.Reader) (string, error) {
-	up, err := b.loadUpload(uploadID)
+	up, err := b.loadUpload(ctx, uploadID)
 	if err != nil {
 		return "", err
 	}
@@ -379,7 +392,7 @@ func pipePart(w io.Writer, rw *pool.RW) error {
 // S3-style multipart ETag, and stores the user metadata so HeadObject and
 // GetObject see the same fields the in-memory PutObject path produces.
 func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, objectName string, uploadID gofakes3.UploadID, input *gofakes3.CompleteMultipartUploadRequest) (gofakes3.VersionID, string, error) {
-	up, err := b.loadUpload(uploadID)
+	up, err := b.loadUpload(ctx, uploadID)
 	if err != nil {
 		return "", "", err
 	}
@@ -387,7 +400,7 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 	defer up.endActivity()
 
 	if err := up.validate(input); err != nil {
-		b.multipartUploads.Delete(uploadID)
+		b.deleteUpload(uploadID, up)
 		_ = up.abort()
 		b.discardUpload(up)
 		return "", "", err
@@ -397,7 +410,7 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 	// streamed parts don't form the complete object; abort then tears it
 	// down. (After a successful or failed commit the abort is a no-op.)
 	if err := up.close(); err != nil {
-		b.multipartUploads.Delete(uploadID)
+		b.deleteUpload(uploadID, up)
 		_ = up.abort()
 		b.discardUpload(up)
 		return "", "", err
@@ -414,17 +427,17 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 			return "", "", err
 		}
 	}
-	b.multipartUploads.Delete(uploadID)
+	b.deleteUpload(uploadID, up)
 
-	b.meta.Store(up.fp, up.meta)
+	up.tenant.setMeta(up.fp, up.meta)
 	if val, ok := up.meta["X-Amz-Meta-Mtime"]; ok {
 		if ti, err := swift.FloatStringToTime(val); err == nil {
-			b.storeModtime(up.fp, up.meta, val)
+			up.tenant.storeModtime(up.fp, up.meta, val)
 			_ = up.vfs.Chtimes(up.fp, ti, ti)
 		}
 	} else if val, ok := up.meta["mtime"]; ok {
 		if ti, err := swift.FloatStringToTime(val); err == nil {
-			b.storeModtime(up.fp, up.meta, val)
+			up.tenant.storeModtime(up.fp, up.meta, val)
 			_ = up.vfs.Chtimes(up.fp, ti, ti)
 		}
 	}
@@ -435,11 +448,11 @@ func (b *s3Backend) CompleteMultipartUpload(ctx context.Context, bucketName, obj
 // AbortMultipartUpload tears down an in-progress upload, discarding any data
 // already received.
 func (b *s3Backend) AbortMultipartUpload(ctx context.Context, bucketName, objectName string, uploadID gofakes3.UploadID) error {
-	up, err := b.loadUpload(uploadID)
+	up, err := b.loadUpload(ctx, uploadID)
 	if err != nil {
 		return err
 	}
-	defer b.multipartUploads.Delete(uploadID)
+	defer b.deleteUpload(uploadID, up)
 	if err := up.abort(); err != nil {
 		fs.Errorf(up.fp, "aborting multipart upload: %v", err)
 	}
@@ -475,7 +488,15 @@ func (b *s3Backend) stopReaper() {
 // reapExpiredUploads aborts and cleans up multipart uploads which have had
 // no request activity for longer than expiry.
 func (b *s3Backend) reapExpiredUploads(now time.Time, expiry time.Duration) {
-	b.multipartUploads.Range(func(key, value any) bool {
+	for _, t := range b.allTenants() {
+		b.reapExpiredTenantUploads(t, now, expiry)
+	}
+}
+
+// reapExpiredTenantUploads aborts and cleans up the multipart uploads of
+// t which have had no request activity for longer than expiry.
+func (b *s3Backend) reapExpiredTenantUploads(t *tenant, now time.Time, expiry time.Duration) {
+	t.uploads.Range(func(key, value any) bool {
 		uploadID := key.(gofakes3.UploadID)
 		up := value.(*multipartUpload)
 		up.mu.Lock()
@@ -485,7 +506,7 @@ func (b *s3Backend) reapExpiredUploads(now time.Time, expiry time.Duration) {
 			return true
 		}
 		fs.Logf(up.fp, "aborting multipart upload %s idle for more than %v", uploadID, expiry)
-		b.multipartUploads.Delete(uploadID)
+		b.deleteUpload(uploadID, up)
 		if err := up.abort(); err != nil {
 			fs.Errorf(up.fp, "aborting abandoned multipart upload: %v", err)
 		}

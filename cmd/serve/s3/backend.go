@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -39,11 +40,10 @@ const putObjectPrefix = tempObjectPrefix + "put_"
 // PutStream, instead of being buffered in memory by gofakes3.
 type s3Backend struct {
 	s    *Server
-	meta *sync.Map
+	meta *sync.Map // object metadata of all tenants, keyed by metaKey
 
-	// multipartUploads tracks in-flight streaming multipart uploads,
-	// keyed by gofakes3.UploadID.
-	multipartUploads sync.Map
+	tenantsMu sync.Mutex
+	tenants   map[string]*tenant // per-user state by tenant ID
 
 	// warnInMemoryOnce logs a single NOTICE the first time a multipart
 	// upload falls back to being buffered in memory.
@@ -53,13 +53,68 @@ type s3Backend struct {
 	reaperStop sync.Once
 }
 
+// tenant is the state kept between requests for one user of the server.
+//
+// Anything remembered about a user's objects or uploads must be reached
+// through their tenant, as different users may be serving different
+// backends.
+type tenant struct {
+	b  *s3Backend
+	id string
+
+	// uploads tracks in-flight streaming multipart uploads,
+	// keyed by gofakes3.UploadID.
+	uploads sync.Map
+}
+
+// metaKey is the key of an object's metadata in s3Backend.meta.
+type metaKey struct {
+	tenant string // tenant ID
+	fp     string // object path
+}
+
 // newBackend creates a new SimpleBucketBackend.
 func newBackend(s *Server) *s3Backend {
 	return &s3Backend{
 		s:          s,
 		meta:       new(sync.Map),
+		tenants:    map[string]*tenant{},
 		reaperQuit: make(chan struct{}),
 	}
+}
+
+// tenant returns the state of the user making the request in ctx.
+func (b *s3Backend) tenant(ctx context.Context) *tenant {
+	id := b.s.getTenant(ctx)
+	b.tenantsMu.Lock()
+	defer b.tenantsMu.Unlock()
+	t, ok := b.tenants[id]
+	if !ok {
+		t = &tenant{b: b, id: id}
+		b.tenants[id] = t
+	}
+	return t
+}
+
+// allTenants returns the state of every user seen so far.
+func (b *s3Backend) allTenants() []*tenant {
+	b.tenantsMu.Lock()
+	defer b.tenantsMu.Unlock()
+	return slices.Collect(maps.Values(b.tenants))
+}
+
+// getMeta returns the stored metadata of the object at fp.
+func (t *tenant) getMeta(fp string) (meta map[string]string, ok bool) {
+	val, ok := t.b.meta.Load(metaKey{tenant: t.id, fp: fp})
+	if !ok {
+		return nil, false
+	}
+	return val.(map[string]string), true
+}
+
+// setMeta stores meta as the metadata of the object at fp.
+func (t *tenant) setMeta(fp string, meta map[string]string) {
+	t.b.meta.Store(metaKey{tenant: t.id, fp: fp}, meta)
 }
 
 // ListBuckets always returns the default bucket.
@@ -175,8 +230,7 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 		"Content-Type":  mimeType,
 	}
 
-	if val, ok := b.meta.Load(fp); ok {
-		metaMap := val.(map[string]string)
+	if metaMap, ok := b.tenant(ctx).getMeta(fp); ok {
 		maps.Copy(meta, metaMap)
 	}
 
@@ -256,8 +310,7 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 		"Content-Type":  mimeType,
 	}
 
-	if val, ok := b.meta.Load(fp); ok {
-		metaMap := val.(map[string]string)
+	if metaMap, ok := b.tenant(ctx).getMeta(fp); ok {
 		maps.Copy(meta, metaMap)
 	}
 
@@ -271,12 +324,12 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 	}, nil
 }
 
-// storeModtime sets both "mtime" and "X-Amz-Meta-Mtime" to val in b.meta.
-// Call this whenever modtime is updated.
-func (b *s3Backend) storeModtime(fp string, meta map[string]string, val string) {
+// storeModtime sets both "mtime" and "X-Amz-Meta-Mtime" to val in the
+// stored metadata. Call this whenever modtime is updated.
+func (t *tenant) storeModtime(fp string, meta map[string]string, val string) {
 	meta["X-Amz-Meta-Mtime"] = val
 	meta["mtime"] = val
-	b.meta.Store(fp, meta)
+	t.setMeta(fp, meta)
 }
 
 // TouchObject creates or updates meta on specified object.
@@ -302,12 +355,12 @@ func (b *s3Backend) TouchObject(ctx context.Context, fp string, meta map[string]
 		return result, err
 	}
 
-	b.meta.Store(fp, meta)
+	b.tenant(ctx).setMeta(fp, meta)
 
 	if val, ok := meta["X-Amz-Meta-Mtime"]; ok {
 		ti, err := swift.FloatStringToTime(val)
 		if err == nil {
-			b.storeModtime(fp, meta, val)
+			b.tenant(ctx).storeModtime(fp, meta, val)
 			return result, _vfs.Chtimes(fp, ti, ti)
 		}
 		// ignore error since the file is successfully created
@@ -316,7 +369,7 @@ func (b *s3Backend) TouchObject(ctx context.Context, fp string, meta map[string]
 	if val, ok := meta["mtime"]; ok {
 		ti, err := swift.FloatStringToTime(val)
 		if err == nil {
-			b.storeModtime(fp, meta, val)
+			b.tenant(ctx).storeModtime(fp, meta, val)
 			return result, _vfs.Chtimes(fp, ti, ti)
 		}
 		// ignore error since the file is successfully created
@@ -423,12 +476,12 @@ func (b *s3Backend) PutObject(
 		return result, err
 	}
 
-	b.meta.Store(fp, meta)
+	b.tenant(ctx).setMeta(fp, meta)
 
 	if val, ok := meta["X-Amz-Meta-Mtime"]; ok {
 		ti, err := swift.FloatStringToTime(val)
 		if err == nil {
-			b.storeModtime(fp, meta, val)
+			b.tenant(ctx).storeModtime(fp, meta, val)
 			return result, _vfs.Chtimes(fp, ti, ti)
 		}
 		// ignore error since the file is successfully created
@@ -437,7 +490,7 @@ func (b *s3Backend) PutObject(
 	if val, ok := meta["mtime"]; ok {
 		ti, err := swift.FloatStringToTime(val)
 		if err == nil {
-			b.storeModtime(fp, meta, val)
+			b.tenant(ctx).storeModtime(fp, meta, val)
 			return result, _vfs.Chtimes(fp, ti, ti)
 		}
 		// ignore error since the file is successfully created
@@ -561,7 +614,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
 		return result, err
 	}
 	if srcBucket == dstBucket && srcKey == dstKey {
-		b.meta.Store(fp, meta)
+		b.tenant(ctx).setMeta(fp, meta)
 
 		val, ok := meta["X-Amz-Meta-Mtime"]
 		if !ok {
@@ -574,7 +627,7 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
 		if err != nil {
 			return result, nil
 		}
-		b.storeModtime(fp, meta, val)
+		b.tenant(ctx).storeModtime(fp, meta, val)
 
 		return result, _vfs.Chtimes(fp, ti, ti)
 	}

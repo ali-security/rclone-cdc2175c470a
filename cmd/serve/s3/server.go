@@ -25,6 +25,7 @@ type ctxKey int
 
 const (
 	ctxKeyID ctxKey = iota
+	ctxKeyAccessKeyID
 )
 
 // Server is a s3.FileSystem interface
@@ -101,6 +102,7 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Opt
 		gofakes3.WithoutVersioning(),
 		gofakes3.WithV4Auth(authList),
 		gofakes3.WithIntegrityCheck(true), // Check Content-MD5 if supplied
+		gofakes3.WithUploadOwner(w.getTenant),
 	)
 
 	w.handler = w.faker.Server()
@@ -140,6 +142,19 @@ func (w *Server) getVFS(ctx context.Context) (VFS *vfs.VFS, err error) {
 		return nil, fmt.Errorf("context value is not VFS: %#v", value)
 	}
 	return VFS, nil
+}
+
+// getTenant returns the ID of the user making the request in ctx: the
+// access key ID the auth proxy authenticated the request with, or "" when
+// not using an auth proxy.
+//
+// The proxy may map each access key ID to a different backend, so state
+// kept across requests must be scoped to it. The *vfs.VFS can't be used
+// for this as the proxy may hand the same access key ID different ones,
+// for example from different client IPs or after its cache expires.
+func (w *Server) getTenant(ctx context.Context) string {
+	accessKeyID, _ := ctx.Value(ctxKeyAccessKeyID).(string)
+	return accessKeyID
 }
 
 // auth authenticates the request via the auth proxy.
@@ -222,8 +237,9 @@ func proxyAuthMiddleware(next http.Handler, ws *Server) http.Handler {
 			accessDenied(w)
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyID, VFS))
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), ctxKeyID, VFS)
+		ctx = context.WithValue(ctx, ctxKeyAccessKeyID, accessKey)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
